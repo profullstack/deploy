@@ -1,0 +1,32 @@
+{
+  "name": "@profullstack/deploy",
+  "version": "0.1.0",
+  "description": "Deploy in batches, 3 at a time: a box-wide deploy gate (bash + flock) every deploy takes a slot from, and a batch runner for rolling one change out to many repos. Zero dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Profullstack, Inc.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/profullstack/deploy.git"
+  },
+  "homepage": "https://github.com/profullstack/deploy#readme",
+  "keywords": ["deploy", "concurrency", "batch", "flock", "semaphore", "oom", "fleet", "rollout"],
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "types": "./index.d.ts",
+  "bin": {
+    "pfdeploy": "bin/pfdeploy.js",
+    "deploy-gate": "bin/deploy-gate"
+  },
+  "files": ["bin", "src", "index.d.ts", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
