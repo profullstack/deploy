@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# deploy-gate: at most N deploys build at once on this box, whoever starts them.
+#
+#   deploy-gate [--slots 3] [--name site] [--wait 3600] [--min-free-gb 8] -- command [args...]
+#   deploy-gate status
+#
+# Every deploy path on the box (cli-tools deploy-app.sh, OpenInstall bin/install.sh,
+# a hand-run build) wraps itself in this. A deploy takes one of N slots, a file
+# lock under DEPLOY_LOCK_DIR shared by every user, waits while all are taken,
+# then waits a little for free memory, then runs. Thirty-eight merges at once
+# become three builds at a time and a queue, instead of an out-of-memory kill of
+# the production database (dev2, 2026-10-19).
+#
+# The command runs with the lock's descriptor closed, so a daemon it starts never
+# holds the slot. A deploy already inside the gate (DEPLOY_GATED=1) passes
+# straight through, so nested scripts never wait on themselves.
+#
+# Environment (flags win): DEPLOY_SLOTS=3, DEPLOY_WAIT=3600 (seconds for a slot;
+# then exit 75, or run anyway with DEPLOY_GATE_ON_TIMEOUT=run), DEPLOY_MIN_FREE_GB=8,
+# DEPLOY_MEM_WAIT=600 (seconds to wait for memory, then go on), DEPLOY_POLL=5, DEPLOY_LOCK_DIR.
+set -uo pipefail
+
+SLOTS=${DEPLOY_SLOTS:-3}
+WAIT=${DEPLOY_WAIT:-3600}
+MIN_FREE_GB=${DEPLOY_MIN_FREE_GB:-8}
+MEM_WAIT=${DEPLOY_MEM_WAIT:-600}
+POLL=${DEPLOY_POLL:-5}
+LOCK_DIR=${DEPLOY_LOCK_DIR:-/run/lock/profullstack-deploy}
+NAME=""
+
+say() { printf '[deploy-gate] %s\n' "$*" >&2; }
+usage() { sed -n '4,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+
+lock_dir() {
+  if [ ! -d "$LOCK_DIR" ]; then
+    (umask 000; mkdir -p "$LOCK_DIR") 2>/dev/null || { say "cannot make $LOCK_DIR"; return 1; }
+    chmod 1777 "$LOCK_DIR" 2>/dev/null || true
+  fi
+}
+
+slot_file() { printf '%s/slot-%s' "$LOCK_DIR" "$1"; }
+
+# The holder line written into a slot: who, since when.
+holder() { head -c 200 "$(slot_file "$1")" 2>/dev/null | head -1; }
+
+status() {
+  lock_dir || exit 1
+  local i f busy=0
+  for ((i = 0; i < SLOTS; i++)); do
+    f=$(slot_file "$i")
+    [ -e "$f" ] || (umask 000; : > "$f")
+    if flock -n "$f" true 2>/dev/null; then
+      printf 'slot %d  free\n' "$i"
+    else
+      busy=$((busy + 1))
+      printf 'slot %d  busy  %s\n' "$i" "$(holder "$i")"
+    fi
+  done
+  printf '%d of %d busy, %s GB available\n' "$busy" "$SLOTS" "$(free_gb)"
+}
+
+free_gb() { awk '/^MemAvailable:/ { printf "%d", $2 / 1048576 }' /proc/meminfo 2>/dev/null || echo 0; }
+
+[ "${1:-}" = status ] && { shift; [ "${1:-}" = --slots ] && SLOTS=$2; status; exit 0; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --slots) SLOTS=$2; shift 2 ;;
+    --name) NAME=$2; shift 2 ;;
+    --wait) WAIT=$2; shift 2 ;;
+    --min-free-gb) MIN_FREE_GB=$2; shift 2 ;;
+    --) shift; break ;;
+    -h|--help) usage ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || usage
+case "$SLOTS" in ''|*[!0-9]*|0) say "--slots must be a positive number"; exit 64 ;; esac
+
+# Already inside the gate: never take a second slot.
+if [ "${DEPLOY_GATED:-}" = 1 ]; then exec "$@"; fi
+NAME=${NAME:-$(basename "$PWD")}
+export DEPLOY_GATED=1
+
+if ! command -v flock >/dev/null || ! lock_dir; then
+  say "no flock or lock dir: running ungated"
+  exec "$@"
+fi
+
+# Take a slot. Start at a random slot so waiters spread out; poll every DEPLOY_POLL (5) s.
+fd=""
+start=$(date +%s)
+last_note=0
+while :; do
+  first=$((RANDOM % SLOTS))
+  for ((n = 0; n < SLOTS; n++)); do
+    i=$(((first + n) % SLOTS))
+    f=$(slot_file "$i")
+    [ -e "$f" ] || (umask 000; : > "$f") 2>/dev/null
+    { exec {fd}<>"$f"; } 2>/dev/null || continue
+    if flock -n "$fd"; then
+      slot=$i
+      break 2
+    fi
+    exec {fd}>&-
+    fd=""
+  done
+  now=$(date +%s)
+  if [ $((now - start)) -ge "$WAIT" ]; then
+    if [ "${DEPLOY_GATE_ON_TIMEOUT:-fail}" = run ]; then
+      say "waited ${WAIT}s for a slot; running anyway (DEPLOY_GATE_ON_TIMEOUT=run)"
+      exec "$@"
+    fi
+    say "waited ${WAIT}s for one of $SLOTS deploy slots; giving up (exit 75). Busy: $(for ((i = 0; i < SLOTS; i++)); do printf '%s; ' "$(holder "$i")"; done)"
+    exit 75
+  fi
+  if [ $((now - last_note)) -ge 30 ]; then
+    say "$NAME waiting for a deploy slot ($SLOTS busy): $(for ((i = 0; i < SLOTS; i++)); do printf '%s; ' "$(holder "$i")"; done)"
+    last_note=$now
+  fi
+  sleep "$POLL"
+done
+
+# Say who holds it (truncate, then write: the lock is on the descriptor, not the content).
+printf '%s pid %s since %s\n' "$NAME" "$$" "$(date -u +%FT%TZ)" > "$(slot_file "$slot")" 2>/dev/null || true
+waited=$(($(date +%s) - start))
+say "$NAME took deploy slot $slot of $SLOTS$([ "$waited" -gt 0 ] && printf ' after %ss' "$waited")"
+
+# Then a little room: never start a build into a box that is already out of memory.
+mem_start=$(date +%s)
+while [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; do
+  if [ $(($(date +%s) - mem_start)) -ge "$MEM_WAIT" ]; then
+    say "only $(free_gb) GB available after ${MEM_WAIT}s; going on"
+    break
+  fi
+  say "$(free_gb) GB available, want $MIN_FREE_GB; waiting"
+  sleep 15
+done
+
+# Run with the lock descriptor closed, forwarding signals, and release when it ends.
+child=""
+forward() { [ -n "$child" ] && kill "-$1" "$child" 2>/dev/null; }
+trap 'forward TERM' TERM
+trap 'forward INT' INT
+trap 'forward HUP' HUP
+"$@" {fd}>&- &
+child=$!
+while :; do
+  wait "$child"
+  rc=$?
+  # wait returns early (>128) when a trapped signal arrives; keep waiting for the child.
+  kill -0 "$child" 2>/dev/null || break
+done
+: > "$(slot_file "$slot")" 2>/dev/null || true
+exec {fd}>&-
+exit "$rc"
