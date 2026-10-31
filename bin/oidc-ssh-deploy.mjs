@@ -15,6 +15,48 @@ import { fileURLToPath } from 'node:url'
 
 export const AUDIENCE = 'profullstack-deploy'
 
+const TARGETS_FILE = new URL('../fleet/targets.json', import.meta.url)
+const FLEET_FILE = new URL('../fleet/config.json', import.meta.url)
+const HOSTS_FILE = new URL('../ssh/known_hosts', import.meta.url)
+
+/** Repository ID is from GitHub's runner, NOT a caller-controlled target. */
+export function resolveFleetTarget(env, targets, fleet) {
+  const id = String(env.GITHUB_REPOSITORY_ID || '')
+  const target = targets[id]
+  if (!target || !target.enabled) throw new Error('Repository is not enrolled or enabled in the central fleet registry')
+  if (target.repository !== env.GITHUB_REPOSITORY || target.ref !== env.GITHUB_REF) {
+    throw new Error('Fleet registry repository or branch mismatch')
+  }
+  if (typeof target.health_url !== 'string' || !target.health_url.startsWith('https://')) {
+    throw new Error('Fleet target needs an HTTPS health URL')
+  }
+  const health = new URL(target.health_url)
+  if (health.protocol !== 'https:' || health.username || health.password) throw new Error('Invalid health URL')
+  return {
+    env: {
+      ...env,
+      PFDEPLOY_HOST: target.host,
+      PFDEPLOY_PORT: String(target.port || 22),
+      PFDEPLOY_OPENBAO_URL: fleet.openbao_url || '',
+    },
+    health_url: health.href,
+  }
+}
+
+/** A deployed app must answer health after SSH succeeds. */
+async function verifyHealth(url) {
+  let lastError = null
+  for (let i = 0; i < 5; i++) {
+    try {
+      const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(12000) })
+      if (response.ok) { console.log('Health check passed:', url); return }
+      lastError = new Error('HTTP ' + response.status)
+    } catch (error) { lastError = error }
+    if (i < 4) await new Promise(r => setTimeout(r, 3000))
+  }
+  throw new Error('Deployment health check failed: ' + (lastError?.message || 'unknown'))
+}
+
 export function validateContext(env) {
   const id = env.GITHUB_REPOSITORY_ID || ''
   const sha = env.GITHUB_SHA || ''
@@ -41,11 +83,12 @@ export function validateContext(env) {
   return { id, sha, repository, ref, host, port, bao: bao.origin, username: 'pfdeploy-' + id }
 }
 
-async function jsonRequest(url, { bearer, body } = {}) {
+async function jsonRequest(url, { bearer, vaultToken, body } = {}) {
   const response = await fetch(url, {
     method: body ? 'POST' : 'GET',
     headers: { accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}),
-      ...(bearer ? { authorization: 'Bearer ' + bearer } : {}) },
+      ...(bearer ? { authorization: 'Bearer ' + bearer } : {}),
+      ...(vaultToken ? { 'x-vault-token': vaultToken } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(15000),
   })
@@ -63,8 +106,12 @@ async function githubOidc(env) {
 }
 
 export async function deploy(env = process.env) {
+  const targets = JSON.parse(readFileSync(TARGETS_FILE, 'utf8'))
+  const fleet = JSON.parse(readFileSync(FLEET_FILE, 'utf8'))
+  const deployment = resolveFleetTarget(env, targets, fleet)
+  env = deployment.env
   const cfg = validateContext(env)
-  const knownHosts = resolve(env.PFDEPLOY_KNOWN_HOSTS || '')
+  const knownHosts = fileURLToPath(HOSTS_FILE)
   const content = readFileSync(knownHosts, 'utf8')
   if (!content.trim() || !content.split(/\r?\n/).some(s => s && !s.startsWith('#'))) {
     throw new Error('No pinned server host keys or host CA in known_hosts; refusing insecure SSH')
@@ -82,7 +129,7 @@ export async function deploy(env = process.env) {
     const vaultToken = login?.auth?.client_token
     if (typeof vaultToken !== 'string' || !vaultToken) throw new Error('OpenBao JWT login did not yield a token')
     const signed = await jsonRequest(cfg.bao + '/v1/ssh-client-signer/sign/repo-' + cfg.id, {
-      bearer: vaultToken,
+      vaultToken,
       body: { public_key: publicKey, valid_principals: cfg.username, ttl: '5m' },
     })
     if (typeof signed?.data?.signed_key !== 'string' || !signed.data.signed_key.includes('-cert-v01@openssh.com')) {
@@ -96,6 +143,7 @@ export async function deploy(env = process.env) {
       '-o', 'ConnectTimeout=15', '-p', cfg.port,
       '-i', key, cfg.username + '@' + cfg.host, 'deploy ' + cfg.sha,
     ], { stdio: 'inherit' })
+    await verifyHealth(deployment.health_url)
   } finally {
     rmSync(temp, { recursive: true, force: true })
   }
