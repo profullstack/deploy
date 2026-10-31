@@ -115,11 +115,12 @@ The receiver requires a dedicated checkout and runs its `bin/install.sh` under t
 
 - Reviewed merge commit `d91e84f93230232410c231d48e47df122631fbf5`, PR #2, current workflow, registry, scripts, and tests.
 - Merge CI run `41192340522` succeeded on that commit. Its only job ran `npm test`; it did not run security scanning, a real GitHub OIDC exchange, or deployment.
-- `npm test` on the hardened audit branch: **31 tests pass** (local final run; hosted PR CI is still required).
+- Audit PR #3 hosted CI run `41200192304` passed; it ran `npm test`. Both Socket Security checks (Project Report and Pull Request Alerts) also passed. No ThreatCrush scan ran in this central repository.
+- `npm test` on the hardened audit branch: **31 tests pass** locally and in the hosted PR check.
 - `node --check bin/oidc-ssh-deploy.mjs`: passed.
 - `bash -n bin/enroll-repo-openbao.sh`, `bash -n bin/pfdeploy-ssh-receiver`, `bash -n bin/deploy-gate`, and `bash -n bin/setup-deploy-gate`: passed. The scripts are also covered by the repository test suite.
 - ShellCheck: passed with no findings. The signal handler is called by a trap and is documented as such.
-- `actionlint` was not installed in the audit environment. The GitHub workflow was reviewed manually and will be exercised by the PR's hosted check; no claim is made that it passed actionlint.
+- `actionlint` was not installed in the audit environment. The reusable workflow was reviewed manually; hosted CI validates the repository's test workflow and does not exercise the deploy workflow against real GitHub OIDC or production infrastructure.
 
 ### Disposable OpenBao and SSH environment
 
