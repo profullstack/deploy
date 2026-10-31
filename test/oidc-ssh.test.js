@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { validateContext, AUDIENCE } from '../bin/oidc-ssh-deploy.mjs'
+import { validateContext, resolveFleetTarget, AUDIENCE } from '../bin/oidc-ssh-deploy.mjs'
 
 const valid = {
   GITHUB_REPOSITORY_ID: '1423083790',
@@ -36,4 +36,21 @@ describe('central fleet OIDC deployment context', () => {
   })) {
     it(name, () => assert.throws(() => validateContext({ ...valid, ...change })))
   }
+})
+
+describe('central repository-to-deployment mapping', () => {
+  const targets = { '1423083790': { repository: 'moshcoder/pit.world', ref: 'refs/heads/main', host: 'dev2.profullstack.com', port: 22, health_url: 'https://pit.world/health', enabled: true } }
+  const fleet = { openbao_url: 'https://openbao.example.net' }
+  it('resolves the target by immutable GitHub repository ID', () => {
+    const result = resolveFleetTarget(valid, targets, fleet)
+    assert.equal(result.env.PFDEPLOY_HOST, 'dev2.profullstack.com')
+    assert.equal(result.env.PFDEPLOY_OPENBAO_URL, fleet.openbao_url)
+    assert.equal(result.health_url, 'https://pit.world/health')
+  })
+  it('refuses unknown, disabled and wrong repository/branch mappings', () => {
+    assert.throws(() => resolveFleetTarget(valid, {}, fleet))
+    assert.throws(() => resolveFleetTarget(valid, { '1423083790': { ...targets['1423083790'], enabled: false } }, fleet))
+    assert.throws(() => resolveFleetTarget({ ...valid, GITHUB_REPOSITORY: 'other/repo' }, targets, fleet))
+    assert.throws(() => resolveFleetTarget({ ...valid, GITHUB_REF: 'refs/heads/master' }, targets, fleet))
+  })
 })
