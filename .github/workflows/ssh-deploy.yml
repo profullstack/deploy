@@ -1,27 +1,9 @@
-# Shared job for all properties, after caller CI and security scans pass.
-# GitHub OIDC -> OpenBao JWT auth -> five-minute SSH user certificate.
+# One shared deploy job. Every caller still gates this job on tests/security scans.
+# All repository, server and service mappings live in fleet/targets.json.
 name: Fleet SSH deploy
 
 on:
   workflow_call:
-    inputs:
-      host:
-        description: Pinned SSH host enrolled with the SSH user CA
-        required: true
-        type: string
-      openbao_url:
-        description: Public HTTPS OpenBao endpoint (not a secret)
-        required: true
-        type: string
-      health_url:
-        description: Public HTTPS health check for this property
-        required: true
-        type: string
-      port:
-        description: SSH port
-        required: false
-        type: number
-        default: 22
 
 permissions:
   contents: read
@@ -36,7 +18,7 @@ jobs:
       group: fleet-deploy-${{ github.repository_id }}
       cancel-in-progress: false
     steps:
-      - name: Checkout central deploy tooling and pinned host keys
+      - name: Checkout central deployment tools, target registry and pinned SSH hosts
         uses: actions/checkout@v4
         with:
           repository: profullstack/deploy
@@ -47,16 +29,5 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Authenticate GitHub OIDC, sign ephemeral SSH key, deploy
+      - name: GitHub OIDC to OpenBao to ephemeral SSH certificate to deployed app
         run: node .pfdeploy/bin/oidc-ssh-deploy.mjs
-        env:
-          PFDEPLOY_HOST: ${{ inputs.host }}
-          PFDEPLOY_PORT: ${{ inputs.port }}
-          PFDEPLOY_OPENBAO_URL: ${{ inputs.openbao_url }}
-          PFDEPLOY_KNOWN_HOSTS: .pfdeploy/ssh/known_hosts
-      - name: Verify public service health
-        env:
-          HEALTH_URL: ${{ inputs.health_url }}
-        run: |
-          case "$HEALTH_URL" in https://*) ;; *) echo "Health URL must use HTTPS" >&2; exit 1;; esac
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$HEALTH_URL" >/dev/null
