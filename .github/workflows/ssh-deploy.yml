@@ -1,0 +1,33 @@
+# One shared deploy job. Every caller still gates this job on tests/security scans.
+# All repository, server and service mappings live in fleet/targets.json.
+name: Fleet SSH deploy
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: fleet-deploy-${{ github.repository_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout central deployment tools, target registry and pinned SSH hosts
+        uses: actions/checkout@v4
+        with:
+          repository: profullstack/deploy
+          ref: main
+          path: .pfdeploy
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: GitHub OIDC to OpenBao to ephemeral SSH certificate to deployed app
+        run: node .pfdeploy/bin/oidc-ssh-deploy.mjs

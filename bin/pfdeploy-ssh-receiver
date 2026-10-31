@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Root-owned SSHD ForceCommand, entered as a per-repository unprivileged user.
+# A certificate for one repository cannot authenticate as another repo's user.
+set -euo pipefail
+umask 077
+
+deny() { printf 'pfdeploy: %s\n' "$*" >&2; exit 1; }
+account="$(id -un)"
+[[ "$account" =~ ^pfdeploy-[1-9][0-9]{0,19}$ ]] || deny "unrecognized deployment identity"
+id="${account#pfdeploy-}"
+cfg="/etc/profullstack/deploy/$account.conf"
+[[ -f "$cfg" ]] || deny "repository not enrolled"
+[[ "$(stat -c %u "$cfg")" = 0 ]] || deny "enrollment must be owned by root"
+mode="$(stat -c %a "$cfg")"
+[[ "$mode" = 644 || "$mode" = 640 || "$mode" = 600 ]] || deny "unsafe configuration permissions"
+
+# Strict KEY=value reader; never evaluate shell code from config or SSH input.
+setting() { sed -n "s/^$1=//p" "$cfg" | head -n 1; }
+repo="$(setting REPOSITORY)"
+branch="$(setting BRANCH)"
+checkout="$(setting CHECKOUT)"
+[[ "$repo" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]] || deny "invalid repository enrollment"
+[[ "$branch" = main || "$branch" = master ]] || deny "invalid protected branch"
+[[ "$checkout" = /* && -d "$checkout/.git" ]] || deny "missing dedicated checkout"
+[[ "${SSH_ORIGINAL_COMMAND:-}" =~ ^deploy[[:space:]]([a-f0-9]{40})$ ]] || deny "only deploy FULL_SHA is allowed"
+sha="${BASH_REMATCH[1]}"
+remote="$(git -C "$checkout" remote get-url origin)"
+case "$remote" in
+  "https://github.com/$repo"|"https://github.com/$repo.git"|"git@github.com:$repo.git"|"ssh://git@github.com/$repo.git") ;;
+  *) deny "checkout remote does not match enrolled repository" ;;
+esac
+
+# Only commits on the enrolled main/master branch can be installed.
+git -C "$checkout" fetch --no-tags origin "$branch"
+allowed="$(git -C "$checkout" rev-parse FETCH_HEAD)"
+git -C "$checkout" cat-file -e "$sha^{commit}" || deny "unknown commit"
+git -C "$checkout" merge-base --is-ancestor "$sha" "$allowed" || deny "commit not on approved branch"
+old="$(git -C "$checkout" rev-parse HEAD)"
+git -C "$checkout" merge-base --is-ancestor "$old" "$sha" || deny "refusing rollback"
+git -C "$checkout" checkout --detach --force "$sha"
+cd "$checkout"
+if [[ -x /usr/local/bin/deploy-gate ]]; then
+  exec /usr/local/bin/deploy-gate --name "$id" -- bash bin/install.sh
+fi
+exec bash bin/install.sh

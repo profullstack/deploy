@@ -9,6 +9,12 @@ On 2026-10-19 a change rolled out to 38 repos at once on our production box. Eve
 
 Zero dependencies. Linux (`flock`, `/proc/meminfo`); the batch runner works anywhere Node 18+ does.
 
+## Fleet-wide deployments without per-site SSH keys
+
+**One workflow, one centrally managed SSH certificate authority, zero permanent private deployment keys in app repositories.** On every merge to `main` or `master`, the repository's existing tests/typechecks/ThreatCrush scan run, then the same shared workflow deploys the actual commit. GitHub's signed OIDC assertion authenticates the repo to OpenBao, which returns a five-minute SSH certificate for that repo's restricted account. Target hosts and health endpoints live in `fleet/targets.json` keyed by stable GitHub repository ID; the single signing URL lives in `fleet/config.json`. `fleet/properties.txt` contains the currently supplied property inventory, pending verification of repo/host associations.
+
+See **[Full SSH CA rollout and provisioning guide](docs/fleet-ssh-ca.md)**. The new workflow at `.github/workflows/ssh-deploy.yml` is disabled for an app until its central target entry is explicitly `enabled` and OpenBao + the host trust have been bootstrapped. The existing deployment gate remains in place. **No live app deployment is claimed by this code alone.**
+
 ## On the box: the gate
 
 ```sh

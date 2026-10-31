@@ -1,0 +1,11 @@
+{
+  "1423083790": {
+    "repository": "moshcoder/pit.world",
+    "ref": "refs/heads/main",
+    "host": "dev2.profullstack.com",
+    "port": 22,
+    "health_url": "https://pit.world/health",
+    "enabled": false,
+    "note": "PILOT: Do not enable until SSH CA, unprivileged receiver account, repo checkout and OpenBao role are provisioned. Existing PIT deployment still uses root and static GitHub secret."
+  }
+}

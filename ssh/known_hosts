@@ -1,0 +1,4 @@
+# Operator-pinned SSH host public keys OR SSH host CA entries.
+# Populate from trusted console after verifying fingerprints out of band.
+# Never ssh-keyscan blindly in CI; never disable StrictHostKeyChecking.
+# Example: @cert-authority *.profullstack.com ssh-ed25519 AAAA... verified-host-CA
