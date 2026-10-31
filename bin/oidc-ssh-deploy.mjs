@@ -15,6 +15,16 @@ import { fileURLToPath } from 'node:url'
 
 export const AUDIENCE = 'profullstack-deploy'
 
+/** OpenSSH accepts a single public-key line; OpenBao may return trailing newlines. */
+export function normalizeSignedCertificate(value) {
+  if (typeof value !== 'string') throw new Error('OpenBao did not return an SSH user certificate')
+  const certificate = value.trim()
+  if (!certificate.includes('-cert-v01@openssh.com') || /\r|\n/.test(certificate)) {
+    throw new Error('OpenBao did not return a valid single-line SSH user certificate')
+  }
+  return certificate + '\n'
+}
+
 const TARGETS_FILE = new URL('../fleet/targets.json', import.meta.url)
 const FLEET_FILE = new URL('../fleet/config.json', import.meta.url)
 const HOSTS_FILE = new URL('../ssh/known_hosts', import.meta.url)
@@ -44,15 +54,15 @@ export function resolveFleetTarget(env, targets, fleet) {
 }
 
 /** A deployed app must answer health after SSH succeeds. */
-async function verifyHealth(url) {
+export async function verifyHealth(url, { attempts = 5, retryDelayMs = 3000 } = {}) {
   let lastError = null
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < attempts; i++) {
     try {
       const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(12000) })
       if (response.ok) { console.log('Health check passed:', url); return }
       lastError = new Error('HTTP ' + response.status)
     } catch (error) { lastError = error }
-    if (i < 4) await new Promise(r => setTimeout(r, 3000))
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, retryDelayMs))
   }
   throw new Error('Deployment health check failed: ' + (lastError?.message || 'unknown'))
 }
@@ -132,13 +142,11 @@ export async function deploy(env = process.env) {
       vaultToken,
       body: { public_key: publicKey, valid_principals: cfg.username, ttl: '5m' },
     })
-    if (typeof signed?.data?.signed_key !== 'string' || !signed.data.signed_key.includes('-cert-v01@openssh.com')) {
-      throw new Error('OpenBao did not return an SSH user certificate')
-    }
-    writeFileSync(certificate, signed.data.signed_key + '\n', { mode: 0o600 })
+    writeFileSync(certificate, normalizeSignedCertificate(signed?.data?.signed_key), { mode: 0o600 })
     console.log('Deploying', cfg.repository, cfg.sha.slice(0, 12), 'to', cfg.host, 'with a short-lived SSH certificate')
     execFileSync('ssh', [
       '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+      '-F', '/dev/null',
       '-o', 'UserKnownHostsFile=' + knownHosts, '-o', 'CertificateFile=' + certificate,
       '-o', 'ConnectTimeout=15', '-p', cfg.port,
       '-i', key, cfg.username + '@' + cfg.host, 'deploy ' + cfg.sha,

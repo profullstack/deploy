@@ -1,14 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { batch, freeGb, gatePath, runCommand, shellQuote } from '../src/index.js';
 
 const scratch = () => mkdtempSync(join(tmpdir(), 'pfdeploy-'));
-const run = (args, env = {}) =>
-  new Promise((resolve) => {
+const prepareLocks = (dir, slots = 3) => {
+  if (!existsSync(dir)) mkdirSync(dir, { mode: 0o700 });
+  for (let i = 0; i < slots; i++) {
+    const path = join(dir, `slot-${i}`);
+    if (!existsSync(path)) writeFileSync(path, '', { mode: 0o600, flag: 'wx' });
+  }
+  chmodSync(dir, 0o700);
+};
+const run = (args, env = {}) => {
+  const lockDir = env.DEPLOY_LOCK_DIR;
+  if (lockDir) {
+    const slotIndex = args.indexOf('--slots');
+    const slots = slotIndex >= 0 ? Number(args[slotIndex + 1]) : Number(env.DEPLOY_SLOTS || 3);
+    prepareLocks(lockDir, slots);
+  }
+  return new Promise((resolve) => {
     const child = spawn('bash', [gatePath, ...args], { env: { ...process.env, DEPLOY_MIN_FREE_GB: '0', DEPLOY_POLL: '0.2', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
@@ -16,6 +30,7 @@ const run = (args, env = {}) =>
     child.stderr.on('data', (d) => (err += d));
     child.on('close', (code) => resolve({ code, out, err }));
   });
+};
 
 test('the gate never lets more than --slots deploys run at once', async () => {
   const dir = scratch();
@@ -24,7 +39,7 @@ test('the gate never lets more than --slots deploys run at once', async () => {
   // Each job appends +1 when it starts and -1 when it ends; we replay the log for the peak.
   const job = `echo +1 >> ${log}; sleep 0.6; echo -1 >> ${log}`;
   const started = Date.now();
-  const results = await Promise.all(Array.from({ length: 6 }, (_, i) => run(['--slots', '2', '--name', `site${i}`, '--', 'bash', '-c', job], { DEPLOY_LOCK_DIR: join(dir, 'locks') })));
+  const results = await Promise.all(Array.from({ length: 6 }, (_, i) => run(['--slots', '3', '--name', `site${i}`, '--', 'bash', '-c', job], { DEPLOY_LOCK_DIR: join(dir, 'locks') })));
   assert.ok(results.every((r) => r.code === 0), results.map((r) => r.err).join('\n'));
   let now = 0;
   let peak = 0;
@@ -32,10 +47,10 @@ test('the gate never lets more than --slots deploys run at once', async () => {
     now += Number(line);
     peak = Math.max(peak, now);
   }
-  assert.equal(peak, 2);
-  // Six jobs, two at a time, 0.6 s each: at least three rounds.
-  assert.ok(Date.now() - started >= 1700, `took ${Date.now() - started} ms`);
-  assert.ok(results.every((r) => /took deploy slot [01] of 2/.test(r.err)), results.map((r) => r.err).join('|'));
+  assert.equal(peak, 3);
+  // Six jobs against the production default of three slots run in two rounds.
+  assert.ok(Date.now() - started >= 1000, `took ${Date.now() - started} ms`);
+  assert.ok(results.every((r) => /took deploy slot [012] of 3/.test(r.err)), results.map((r) => r.err).join('|'));
 })
 
 test('exit codes pass through; a nested gate never waits on itself; status names the holder', async () => {
@@ -66,7 +81,7 @@ test('a daemon the deploy starts does not keep the slot', async () => {
   assert.ok(Date.now() - t < 1500, 'the second deploy got the slot at once');
 })
 
-test('a slot that never frees times out with 75, or runs anyway when asked', async () => {
+test('a slot that never frees times out with 75 even when the old bypass flag is set', async () => {
   const dir = scratch();
   const env = { DEPLOY_LOCK_DIR: join(dir, 'locks') };
   const holder = run(['--slots', '1', '--', 'sleep', '8'], env);
@@ -75,10 +90,55 @@ test('a slot that never frees times out with 75, or runs anyway when asked', asy
   assert.equal(late.code, 75);
   assert.match(late.err, /giving up/);
   const forced = await run(['--slots', '1', '--wait', '1', '--', 'echo', 'ran'], { ...env, DEPLOY_GATE_ON_TIMEOUT: 'run' });
-  assert.equal(forced.out.trim(), 'ran');
+  assert.equal(forced.code, 75);
+  assert.equal(forced.out.trim(), '');
   spawnSync('pkill', ['-f', 'sleep 8']);
   await holder;
 })
+
+test('unsafe lock paths and symlinked slots fail closed', async () => {
+  const dir = scratch();
+  const occupied = join(dir, 'not-a-directory');
+  writeFileSync(occupied, 'preserve');
+  const badPath = spawnSync('bash', [gatePath, '--slots', '1', '--', 'echo', 'ran'], {
+    env: { ...process.env, DEPLOY_LOCK_DIR: occupied, DEPLOY_MIN_FREE_GB: '0' }, encoding: 'utf8',
+  });
+  assert.equal(badPath.status, 75);
+  assert.equal(badPath.stdout.trim(), '');
+  assert.equal(readFileSync(occupied, 'utf8'), 'preserve');
+
+  const lockDir = join(dir, 'links');
+  prepareLocks(lockDir, 1);
+  const target = join(dir, 'root-owned-target');
+  writeFileSync(target, 'preserve');
+  unlinkSync(join(lockDir, 'slot-0'));
+  symlinkSync(target, join(lockDir, 'slot-0'));
+  const linked = spawnSync('bash', [gatePath, '--slots', '1', '--', 'echo', 'ran'], {
+    env: { ...process.env, DEPLOY_LOCK_DIR: lockDir, DEPLOY_MIN_FREE_GB: '0' }, encoding: 'utf8',
+  });
+  assert.equal(linked.status, 75);
+  assert.equal(linked.stdout.trim(), '');
+  assert.equal(readFileSync(target, 'utf8'), 'preserve');
+});
+
+test('low-memory timeout rejects the build and releases its slot', async () => {
+  const dir = scratch();
+  const env = { DEPLOY_LOCK_DIR: join(dir, 'locks'), DEPLOY_MIN_FREE_GB: '999999', DEPLOY_MEM_WAIT: '0' };
+  const r = await run(['--slots', '1', '--', 'echo', 'ran'], env);
+  assert.equal(r.code, 75);
+  assert.equal(r.out.trim(), '');
+  assert.match(r.err, /refusing to start a build/);
+  const status = spawnSync('bash', [gatePath, 'status', '--slots', '1'], { env: { ...process.env, ...env }, encoding: 'utf8' });
+  assert.match(status.stdout, /slot 0 {2}free/);
+});
+
+test('a caller cannot spoof the nested-gate marker', async () => {
+  const dir = scratch();
+  const r = await run(['--slots', '1', '--', 'echo', 'ran'], { DEPLOY_LOCK_DIR: join(dir, 'locks'), DEPLOY_GATED: '1' });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out.trim(), 'ran');
+  assert.match(r.err, /took deploy slot/);
+});
 
 test('batch: at most `concurrency` at once, in order, and stops starting after a failure', async () => {
   let running = 0;

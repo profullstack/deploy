@@ -9,10 +9,11 @@ account="$(id -un)"
 [[ "$account" =~ ^pfdeploy-[1-9][0-9]{0,19}$ ]] || deny "unrecognized deployment identity"
 id="${account#pfdeploy-}"
 cfg="/etc/profullstack/deploy/$account.conf"
-[[ -f "$cfg" ]] || deny "repository not enrolled"
+[[ -f "$cfg" && ! -L "$cfg" ]] || deny "repository not enrolled or enrollment is a symlink"
 [[ "$(stat -c %u "$cfg")" = 0 ]] || deny "enrollment must be owned by root"
 mode="$(stat -c %a "$cfg")"
 [[ "$mode" = 644 || "$mode" = 640 || "$mode" = 600 ]] || deny "unsafe configuration permissions"
+[[ "$(realpath -e -- "$cfg")" = "$cfg" ]] || deny "enrollment path is not canonical"
 
 # Strict KEY=value reader; never evaluate shell code from config or SSH input.
 setting() { sed -n "s/^$1=//p" "$cfg" | head -n 1; }
@@ -21,7 +22,21 @@ branch="$(setting BRANCH)"
 checkout="$(setting CHECKOUT)"
 [[ "$repo" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]] || deny "invalid repository enrollment"
 [[ "$branch" = main || "$branch" = master ]] || deny "invalid protected branch"
-[[ "$checkout" = /* && -d "$checkout/.git" ]] || deny "missing dedicated checkout"
+[[ "$checkout" = /* && "$checkout" != *$'\n'* && -d "$checkout/.git" && ! -L "$checkout/.git" ]] || deny "missing dedicated checkout or unsafe Git metadata"
+[[ "$(realpath -e -- "$checkout")" = "$checkout" ]] || deny "checkout path contains symlinks or traversal"
+parent="${checkout%/*}"
+[[ -n "$parent" ]] || parent="/"
+while [[ "$parent" != "/" ]]; do
+  [[ -d "$parent" && ! -L "$parent" && "$(realpath -e -- "$parent")" = "$parent" ]] || deny "checkout parent path is not canonical"
+  parent_owner="$(stat -c %u "$parent")"
+  parent_mode="$(stat -c %a "$parent")"
+  [[ "$parent_owner" = 0 ]] || deny "checkout parent must be root-owned"
+  (( (8#$parent_mode & 0022) == 0 )) || deny "checkout parent must not be group/world-writable"
+  parent="${parent%/*}"
+  [[ -n "$parent" ]] || parent="/"
+done
+[[ "$(stat -c %u "$checkout")" = "$(id -u)" && "$(stat -c %u "$checkout/.git")" = "$(id -u)" ]] || deny "checkout must be owned by its deployment account"
+[[ "$(git -C "$checkout" rev-parse --show-toplevel)" = "$checkout" ]] || deny "Git worktree root does not match enrollment"
 [[ "${SSH_ORIGINAL_COMMAND:-}" =~ ^deploy[[:space:]]([a-f0-9]{40})$ ]] || deny "only deploy FULL_SHA is allowed"
 sha="${BASH_REMATCH[1]}"
 remote="$(git -C "$checkout" remote get-url origin)"
@@ -39,7 +54,8 @@ old="$(git -C "$checkout" rev-parse HEAD)"
 git -C "$checkout" merge-base --is-ancestor "$old" "$sha" || deny "refusing rollback"
 git -C "$checkout" checkout --detach --force "$sha"
 cd "$checkout"
-if [[ -x /usr/local/bin/deploy-gate ]]; then
-  exec /usr/local/bin/deploy-gate --name "$id" -- bash bin/install.sh
-fi
-exec bash bin/install.sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset DEPLOY_GATED DEPLOY_LOCK_DIR DEPLOY_SLOTS DEPLOY_WAIT DEPLOY_MIN_FREE_GB DEPLOY_MEM_WAIT DEPLOY_POLL DEPLOY_GATE_ON_TIMEOUT
+[[ -x /usr/local/bin/deploy-gate ]] || deny "shared deploy-gate is not installed"
+exec /usr/local/bin/deploy-gate --name "$id" -- bash bin/install.sh
