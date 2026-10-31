@@ -1,0 +1,39 @@
+import { describe, it } from 'node:test'
+import assert from 'node:assert/strict'
+import { validateContext, AUDIENCE } from '../bin/oidc-ssh-deploy.mjs'
+
+const valid = {
+  GITHUB_REPOSITORY_ID: '1423083790',
+  GITHUB_SHA: 'a'.repeat(40),
+  GITHUB_REPOSITORY: 'moshcoder/pit.world',
+  GITHUB_REF: 'refs/heads/main',
+  GITHUB_EVENT_NAME: 'push',
+  PFDEPLOY_HOST: 'dev2.profullstack.com',
+  PFDEPLOY_PORT: '22',
+  PFDEPLOY_OPENBAO_URL: 'https://openbao.example.net',
+  ACTIONS_ID_TOKEN_REQUEST_URL: 'https://example.net/oidc',
+  ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-temporary-secret',
+}
+describe('central fleet OIDC deployment context', () => {
+  it('uses stable repo ID for short-lived certificate role and Unix principal', () => {
+    const ctx = validateContext(valid)
+    assert.equal(ctx.username, 'pfdeploy-1423083790')
+    assert.equal(ctx.bao, 'https://openbao.example.net')
+    assert.equal(AUDIENCE, 'profullstack-deploy')
+  })
+  it('supports the master branch', () => {
+    assert.equal(validateContext({ ...valid, GITHUB_REF: 'refs/heads/master' }).ref, 'refs/heads/master')
+  })
+  for (const [name, change] of Object.entries({
+    'reject pull requests': { GITHUB_EVENT_NAME: 'pull_request' },
+    'reject feature branches': { GITHUB_REF: 'refs/heads/feature' },
+    'reject abbreviated SHA': { GITHUB_SHA: 'a'.repeat(12) },
+    'reject missing repo ID': { GITHUB_REPOSITORY_ID: '' },
+    'reject host argument injection': { PFDEPLOY_HOST: 'host; rm -rf /' },
+    'reject plaintext signing service': { PFDEPLOY_OPENBAO_URL: 'http://example.net' },
+    'reject URL credentials': { PFDEPLOY_OPENBAO_URL: 'https://token@example.net' },
+    'reject missing OIDC': { ACTIONS_ID_TOKEN_REQUEST_TOKEN: '' },
+  })) {
+    it(name, () => assert.throws(() => validateContext({ ...valid, ...change })))
+  }
+})
