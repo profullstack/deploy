@@ -1,0 +1,4 @@
+{
+  "openbao_url": "",
+  "note": "Set your centrally managed HTTPS OpenBao origin once after deploying the CA. Never commit private keys or OpenBao tokens."
+}
