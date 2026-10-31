@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { validateContext, resolveFleetTarget, AUDIENCE } from '../bin/oidc-ssh-deploy.mjs'
+import { createServer } from 'node:http'
+import { once } from 'node:events'
+import { validateContext, resolveFleetTarget, normalizeSignedCertificate, verifyHealth, AUDIENCE } from '../bin/oidc-ssh-deploy.mjs'
 
 const valid = {
   GITHUB_REPOSITORY_ID: '1423083790',
@@ -38,6 +40,17 @@ describe('central fleet OIDC deployment context', () => {
   }
 })
 
+describe('OpenBao certificate response handling', () => {
+  it('writes one complete certificate line even when OpenBao returns trailing newlines', () => {
+    const line = 'ssh-ed25519-cert-v01@openssh.com AAAATEST'
+    assert.equal(normalizeSignedCertificate(`${line}\n\n`), `${line}\n`)
+  })
+  it('rejects a multiline or non-certificate signing response', () => {
+    assert.throws(() => normalizeSignedCertificate('ssh-ed25519-cert-v01@openssh.com AAAA\nssh-ed25519 AAAA'))
+    assert.throws(() => normalizeSignedCertificate('ssh-ed25519 AAAA'))
+  })
+})
+
 describe('central repository-to-deployment mapping', () => {
   const targets = { '1423083790': { repository: 'moshcoder/pit.world', ref: 'refs/heads/main', host: 'dev2.profullstack.com', port: 22, health_url: 'https://pit.world/health', enabled: true } }
   const fleet = { openbao_url: 'https://openbao.example.net' }
@@ -52,5 +65,24 @@ describe('central repository-to-deployment mapping', () => {
     assert.throws(() => resolveFleetTarget(valid, { '1423083790': { ...targets['1423083790'], enabled: false } }, fleet))
     assert.throws(() => resolveFleetTarget({ ...valid, GITHUB_REPOSITORY: 'other/repo' }, targets, fleet))
     assert.throws(() => resolveFleetTarget({ ...valid, GITHUB_REF: 'refs/heads/master' }, targets, fleet))
+  })
+})
+
+describe('post-deployment health checks', () => {
+  it('fails the deployment when the health endpoint is not successful', async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(503).end('unhealthy')
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    try {
+      await assert.rejects(
+        verifyHealth(`http://127.0.0.1:${address.port}/health`, { attempts: 1 }),
+        /Deployment health check failed: HTTP 503/,
+      )
+    } finally {
+      await new Promise(resolve => server.close(resolve))
+    }
   })
 })

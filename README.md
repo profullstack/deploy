@@ -2,16 +2,16 @@
 
 Deploy in batches, **3 at a time**, so one box never builds everything at once.
 
-On 2026-10-19 a change rolled out to 38 repos at once on our production box. Every repo installed, tested, type-checked and built together, then every merge's deploy built again; the box ran out of memory and the kernel killed the shared production Postgres. This package makes that impossible from both ends:
+On 2026-10-19 a change rolled out to 38 repos at once on our production box. Every repo installed, tested, type-checked and built together, then every merge's deploy built again; the box ran out of memory and the kernel killed the shared production Postgres. When every production deployment entry point is wired through this package, two controls limit this failure mode:
 
-- **`deploy-gate`** (bash + `flock`, on the box): every deploy takes one of N slots before it builds. Merges can land all at once; builds queue and run three at a time.
+- **`deploy-gate`** (bash + `flock`, on the box): every wired deploy takes one of N slots before it builds. Merges can land all at once; builds queue and run three at a time. A deploy path that bypasses the gate is not covered.
 - **`pfdeploy batch`** (and `batch()`, where the rollout is driven): run one command across many repos, three at a time, stopping at the first failure.
 
 Zero dependencies. Linux (`flock`, `/proc/meminfo`); the batch runner works anywhere Node 18+ does.
 
 ## Fleet-wide deployments without per-site SSH keys
 
-**One workflow, one centrally managed SSH certificate authority, zero permanent private deployment keys in app repositories.** On every merge to `main` or `master`, the repository's existing tests/typechecks/ThreatCrush scan run, then the same shared workflow deploys the actual commit. GitHub's signed OIDC assertion authenticates the repo to OpenBao, which returns a five-minute SSH certificate for that repo's restricted account. Target hosts and health endpoints live in `fleet/targets.json` keyed by stable GitHub repository ID; the single signing URL lives in `fleet/config.json`. `fleet/properties.txt` contains the currently supplied property inventory, pending verification of repo/host associations.
+**One workflow, one centrally managed SSH certificate authority, zero permanent private deployment keys in app repositories.** Each app must retain its own tests, type checks, builds, and ThreatCrush scan, and make the deploy job depend on all of them. The shared workflow cannot verify those caller-side dependencies; protect the deployment branch with required checks and review rules as well. The workflow deploys only the push SHA on `main` or `master`. GitHub's signed OIDC assertion authenticates the repo to OpenBao, which issues a short-lived SSH certificate for that repo's restricted account. Target hosts and health endpoints live in `fleet/targets.json` keyed by stable GitHub repository ID; the single signing URL lives in `fleet/config.json`. `fleet/properties.txt` contains the currently supplied property inventory, pending verification of repo/host associations.
 
 See **[Full SSH CA rollout and provisioning guide](docs/fleet-ssh-ca.md)**. The new workflow at `.github/workflows/ssh-deploy.yml` is disabled for an app until its central target entry is explicitly `enabled` and OpenBao + the host trust have been bootstrapped. The existing deployment gate remains in place. **No live app deployment is claimed by this code alone.**
 
@@ -19,9 +19,13 @@ See **[Full SSH CA rollout and provisioning guide](docs/fleet-ssh-ca.md)**. The 
 
 ```sh
 npx @profullstack/deploy install /usr/local/bin     # as root: one copy every user's deploys share
+install -m 0755 bin/setup-deploy-gate /usr/local/sbin/setup-deploy-gate
+sudo /usr/local/sbin/setup-deploy-gate pfdeploy pfdeploy-1423083790  # root: provision three shared slots and group access
 deploy-gate --name crawlproof -- ./deploy-app.sh "$SHA"
 deploy-gate status
 ```
+
+Provision the gate before creating an SSH deployment account or allowing it to deploy. The setup command creates a root-owned sticky directory, three root-owned group-writable slot files, and a `systemd-tmpfiles` rule so the locks return safely after reboot. Add every per-repository deploy account on that host as an argument. It refuses to adopt an unsafe existing directory; drain deployments and inspect old lock state before replacing an earlier world-writable setup. New SSH sessions pick up the shared group membership.
 
 ```
 slot 0  busy  crawlproof pid 41233 since 2026-10-19T13:20:02Z
@@ -33,15 +37,15 @@ slot 2  free
 How it decides:
 
 1. Take one of `DEPLOY_SLOTS` (3) lock files in `/run/lock/profullstack-deploy` (shared by root and every user). All taken: wait, saying who holds them every 30 s.
-2. Wait up to `DEPLOY_MEM_WAIT` (600 s) for `DEPLOY_MIN_FREE_GB` (8) of available memory, then go on.
+2. Wait up to `DEPLOY_MEM_WAIT` (600 s) for `DEPLOY_MIN_FREE_GB` (8) of available memory, then fail with exit 75 if the host is still below the floor.
 3. Run the deploy with the lock descriptor closed, so a server it starts never keeps the slot. Signals are forwarded; the exit code is the deploy's.
-4. Still no slot after `DEPLOY_WAIT` (3600 s): exit 75 (try again), or run anyway with `DEPLOY_GATE_ON_TIMEOUT=run`.
+4. Still no slot after `DEPLOY_WAIT` (3600 s): exit 75 (try again). Missing or unsafe shared lock files also fail closed; they never start an ungated deploy.
 
-A deploy already inside the gate (`DEPLOY_GATED=1`) passes straight through, so a gated script that calls another gated script never waits on itself. Without `flock` the gate runs the deploy ungated rather than blocking it.
+A deploy already inside the gate passes straight through, so a gated script that calls another gated script never waits on itself. The SSH receiver clears inherited `DEPLOY_GATED` values before entering the gate.
 
 ### Wiring a deploy script
 
-Put this right after `set -euo pipefail`; if the gate is not installed the script runs exactly as before:
+Put this right after `set -euo pipefail`. A deploy script wired to the shared gate fails closed if the gate has not been installed:
 
 ```sh
 # Three deploys at a time on this box (@profullstack/deploy).
@@ -49,6 +53,8 @@ if [ -z "${DEPLOY_GATED:-}" ]; then
   for gate in /usr/local/bin/deploy-gate "$HOME/.local/bin/deploy-gate"; do
     [ -x "$gate" ] && exec "$gate" --name "<site>" -- "$0" "$@"
   done
+  echo "deploy-gate is not installed; refusing to deploy ungated" >&2
+  exit 75
 fi
 ```
 

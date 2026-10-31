@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Root-only host provisioning for the shared cross-user deployment semaphore.
+set -euo pipefail
+
+LOCK_DIR=/run/lock/profullstack-deploy
+GROUP="${1:-pfdeploy}"
+shift || true
+SLOTS="${DEPLOY_SLOTS:-3}"
+
+fail() { printf 'setup-deploy-gate: %s\n' "$*" >&2; exit 1; }
+[[ "$(id -u)" = 0 ]] || fail 'run as root'
+[[ "$GROUP" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || fail 'invalid gate group name'
+[[ "$SLOTS" =~ ^[1-9][0-9]{0,2}$ ]] || fail 'DEPLOY_SLOTS must be from 1 through 256'
+((10#$SLOTS <= 256)) || fail 'DEPLOY_SLOTS must be from 1 through 256'
+SLOTS=$((10#$SLOTS))
+command -v getent >/dev/null || fail 'getent is required'
+command -v groupadd >/dev/null || fail 'groupadd is required'
+command -v usermod >/dev/null || fail 'usermod is required'
+command -v systemd-tmpfiles >/dev/null || fail 'systemd-tmpfiles is required for reboot recovery'
+
+if ! getent group "$GROUP" >/dev/null; then groupadd --system "$GROUP"; fi
+GID="$(getent group "$GROUP" | cut -d: -f3)"
+
+if [ -L "$LOCK_DIR" ]; then fail "$LOCK_DIR is a symlink; inspect and remove it during a drained maintenance window"; fi
+if [ ! -e "$LOCK_DIR" ]; then
+  install -d -o root -g "$GROUP" -m 0700 "$LOCK_DIR"
+else
+  [[ -d "$LOCK_DIR" ]] || fail "$LOCK_DIR exists and is not a directory"
+  [[ "$(stat -c %u "$LOCK_DIR")" = 0 && "$(stat -c %g "$LOCK_DIR")" = "$GID" ]] || fail "$LOCK_DIR must be owned by root:$GROUP"
+  mode="$(stat -c %a "$LOCK_DIR")"
+  [[ "$mode" = 700 || "$mode" = 3770 ]] || fail "$LOCK_DIR has unsafe mode $mode; drain old deployments and inspect it manually"
+fi
+
+for ((i = 0; i < SLOTS; i++)); do
+  slot="$LOCK_DIR/slot-$i"
+  if [ -L "$slot" ]; then fail "$slot is a symlink"; fi
+  if [ ! -e "$slot" ]; then
+    [[ "$(stat -c %a "$LOCK_DIR")" = 700 ]] || fail "cannot add $slot while the shared directory is open to deploy users"
+    install -o root -g "$GROUP" -m 0660 /dev/null "$slot"
+  else
+    [[ -f "$slot" ]] || fail "$slot is not a regular file"
+    [[ "$(stat -c %u "$slot")" = 0 && "$(stat -c %g "$slot")" = "$GID" ]] || fail "$slot must be owned by root:$GROUP"
+    [[ "$(stat -c %a "$slot")" = 660 ]] || fail "$slot must have mode 660"
+  fi
+done
+
+for account in "$@"; do
+  getent passwd "$account" >/dev/null || fail "unknown deployment account: $account"
+  usermod -a -G "$GROUP" "$account"
+done
+
+tmpfiles="/etc/tmpfiles.d/profullstack-deploy.conf"
+tmp="$(mktemp /etc/tmpfiles.d/.profullstack-deploy.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT
+{
+  printf 'd %s 3770 root %s - -\n' "$LOCK_DIR" "$GROUP"
+  for ((i = 0; i < SLOTS; i++)); do
+    printf 'f %s/slot-%s 0660 root %s - -\n' "$LOCK_DIR" "$i" "$GROUP"
+  done
+} >"$tmp"
+if [ -e "$tmpfiles" ] && ! cmp -s "$tmp" "$tmpfiles"; then
+  fail "$tmpfiles already exists with different contents; review it before updating"
+fi
+install -o root -g root -m 0644 "$tmp" "$tmpfiles"
+chmod 3770 "$LOCK_DIR"
+systemd-tmpfiles --create "$tmpfiles"
+
+printf 'Provisioned %s slots in %s for group %s. New SSH sessions pick up account group membership.\n' "$SLOTS" "$LOCK_DIR" "$GROUP"
