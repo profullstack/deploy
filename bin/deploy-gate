@@ -160,7 +160,26 @@ fi
 fd=""
 start=$(date +%s)
 last_note=0
+# First come, first served: each waiter drops a ticket q-<ns>-<pid> in the lock
+# dir, and only the SLOTS oldest live tickets may try for a slot. Without this a
+# random 5 s poll let fresh deploys beat ones that had waited an hour (dev2,
+# 2026-11-11: b1dz waited 20+ min behind 26 others while new arrivals went first).
+ticket="$LOCK_DIR/q-$(date +%s%N)-$$"
+(umask 000; : > "$ticket") 2>/dev/null || ticket=""
+drop_ticket() { [ -n "$ticket" ] && rm -f "$ticket" 2>/dev/null; ticket=""; }
+trap drop_ticket EXIT
+ahead_of_me() {
+  local t pid n=0
+  [ -n "$ticket" ] || { echo 0; return; }
+  for t in "$LOCK_DIR"/q-*; do
+    [ -e "$t" ] && [[ "$t" < "$ticket" ]] || continue
+    pid=${t##*-}
+    if [ -d "/proc/$pid" ]; then n=$((n + 1)); else rm -f "$t" 2>/dev/null; fi
+  done
+  echo "$n"
+}
 while :; do
+  if [ "$(ahead_of_me)" -lt "$SLOTS" ]; then
   first=$((RANDOM % SLOTS))
   for ((n = 0; n < SLOTS; n++)); do
     i=$(((first + n) % SLOTS))
@@ -173,6 +192,7 @@ while :; do
     exec {fd}>&-
     fd=""
   done
+  fi
   now=$(date +%s)
   if [ $((now - start)) -ge "$WAIT" ]; then
     say "waited ${WAIT}s for one of $SLOTS deploy slots; giving up (exit 75). Busy: $(for ((i = 0; i < SLOTS; i++)); do printf '%s; ' "$(holder "$i")"; done)"
@@ -184,6 +204,9 @@ while :; do
   fi
   sleep "$POLL"
 done
+
+drop_ticket
+trap - EXIT
 
 # Say who holds it (truncate, then write: the lock is on the descriptor, not the content).
 printf '%s pid %s since %s\n' "$NAME" "$$" "$(date -u +%FT%TZ)" > "$(slot_file "$slot")" 2>/dev/null || true
