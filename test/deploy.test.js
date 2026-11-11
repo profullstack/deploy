@@ -53,6 +53,24 @@ test('the gate never lets more than --slots deploys run at once', async () => {
   assert.ok(results.every((r) => /took deploy slot [012] of 3/.test(r.err)), results.map((r) => r.err).join('|'));
 })
 
+test('waiters take the slot in arrival order', async () => {
+  const dir = scratch();
+  const log = join(dir, 'log');
+  writeFileSync(log, '');
+  const env = { DEPLOY_LOCK_DIR: join(dir, 'locks') };
+  prepareLocks(env.DEPLOY_LOCK_DIR, 1);
+  const runs = [];
+  for (let i = 0; i < 6; i++) {
+    runs.push(run(['--slots', '1', '--name', `w${i}`, '--', 'bash', '-c', `echo w${i} >> ${log}; sleep 0.4`], env));
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  const results = await Promise.all(runs);
+  assert.ok(results.every((r) => r.code === 0), results.map((r) => r.err).join('\n'));
+  assert.deepEqual(readFileSync(log, 'utf8').trim().split('\n'), ['w0', 'w1', 'w2', 'w3', 'w4', 'w5']);
+  // Every ticket is cleaned up.
+  assert.deepEqual(spawnSync('bash', ['-c', `ls ${env.DEPLOY_LOCK_DIR} | grep '^q-' || true`], { encoding: 'utf8' }).stdout, '');
+});
+
 test('exit codes pass through; a nested gate never waits on itself; status names the holder', async () => {
   const dir = scratch();
   const env = { DEPLOY_LOCK_DIR: join(dir, 'locks') };
